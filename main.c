@@ -188,12 +188,6 @@ void ff_free(void *usr_ptr) {
     freed_size = usr_hdr->size;
     free_chunk = (struct node_t *) usr_hdr; 
 
-    // TODO: what if:
-    // header_t_size=8, node_t_size=16 and freed_size=2
-    // then 2 + 8 - 16 = -6 < 0
-    // therefore in the split in ffmalloc we should allocate
-    // enough memory to write header_t and then overwrite it with node_t
-    //
     free_chunk->size = freed_size;
     free_chunk->next = NULL;
 
@@ -254,8 +248,6 @@ void ff_free(void *usr_ptr) {
         // Do inserted chunk + prev. head form a continuous region in memory?
         // If so, then coalesce
         if ((coalesce_ptr + coalesce_size) == (char *) curr_ptr) {
-            // TODO: something is off here
-            // and probably in all if blocks below
             free_chunk->size += curr_ptr->size + hdr_size;
             free_chunk->next = curr_ptr->next;        
         } 
@@ -306,10 +298,7 @@ void ff_free(void *usr_ptr) {
             free_chunk->size += curr_ptr->size + hdr_size;
             free_chunk->next = curr_ptr->next;        
         } 
-
     }
-
-
 
 }
 
