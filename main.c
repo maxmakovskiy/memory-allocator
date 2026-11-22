@@ -13,7 +13,8 @@
 #include <assert.h>
 
 #define BLOCK_HEAP_SIZE 0x1000
-#define MAGIC_NUMBER 0x1234
+#define MAGIC_NUMBER 0x12345678
+
 
 // info about allocated block
 struct header_t {
@@ -29,6 +30,13 @@ struct node_t {
 
 // head of the free list
 static struct node_t *global_ptr = NULL;
+
+// min amount of bytes we need to store either node_t or header_t
+static const uint32_t hdr_size = (
+        sizeof(struct header_t) < sizeof(struct node_t) 
+        ? sizeof(struct node_t) 
+        : sizeof(struct header_t));
+
 
 void *ffmalloc(uint32_t size);
 void ff_free(void *usr_ptr);
@@ -50,14 +58,12 @@ int main(void) {
 
 void *ffmalloc(uint32_t size) {
     struct node_t *curr_ptr, *prev_ptr;
-    uint32_t node_t_size = sizeof(struct node_t);
-    uint32_t header_t_size = sizeof(struct header_t);
 
     // first-fit strategy
     prev_ptr = NULL; 
     curr_ptr = global_ptr; 
     while (curr_ptr != NULL) {
-        if ((curr_ptr->size + node_t_size) >= (size + header_t_size)) {
+        if (curr_ptr->size >= size) {
             break;
         }
         prev_ptr = curr_ptr;
@@ -69,7 +75,6 @@ void *ffmalloc(uint32_t size) {
     // and once all the free space has been consumed
     // Ask OS to grow heap
     if (curr_ptr == NULL) {
-
         void *ptr;
         
         ptr = sbrk(BLOCK_HEAP_SIZE);
@@ -84,7 +89,7 @@ void *ffmalloc(uint32_t size) {
             // 1st ever ffmalloc
             // allocate 1st BLOCK_HEAP_SIZE with sbrk
             global_ptr = (struct node_t *) ptr;
-            global_ptr->size = BLOCK_HEAP_SIZE - node_t_size;
+            global_ptr->size = BLOCK_HEAP_SIZE - hdr_size;
             global_ptr->next = NULL;
             // update current pointer
             curr_ptr = global_ptr;
@@ -92,7 +97,7 @@ void *ffmalloc(uint32_t size) {
             // not enough space in current heap
             // so grow heap on addition BLOCK_HEAP_SIZE with sbrk
             struct node_t *heap_chunk = (struct node_t *) ptr;
-            heap_chunk->size = BLOCK_HEAP_SIZE - node_t_size;
+            heap_chunk->size = BLOCK_HEAP_SIZE - hdr_size;
             heap_chunk->next = NULL;
             // update current and previous ptr-s
             prev_ptr->next = heap_chunk;
@@ -103,7 +108,7 @@ void *ffmalloc(uint32_t size) {
 
     void *user_ptr;
     // split logic
-    if ((curr_ptr->size + node_t_size) > (size + header_t_size)) {
+    if (curr_ptr->size > size) {
         struct header_t *hdr;
         struct node_t *ptr_next;
         uint32_t ptr_size;
@@ -117,7 +122,7 @@ void *ffmalloc(uint32_t size) {
         // advance temp pointer to where next free chunk pointed by ptr
         // should be (sizeof header + sizeof user request)
         tmp = (char *) curr_ptr;
-        tmp += header_t_size + size;
+        tmp += hdr_size + size;
         
         // save current chunk info
         ptr_next = curr_ptr->next;
@@ -126,7 +131,7 @@ void *ffmalloc(uint32_t size) {
         curr_ptr = (struct node_t *) tmp;
         // compute leftover free space parameters
         curr_ptr->next = ptr_next;
-        curr_ptr->size = ptr_size - (header_t_size + size) + node_t_size;
+        curr_ptr->size = ptr_size - size;
 
         // update previous node in the free list, if any
         if (prev_ptr != NULL) {
@@ -169,7 +174,7 @@ void *ffmalloc(uint32_t size) {
 void ff_free(void *usr_ptr) {
     struct node_t *free_chunk;
     struct header_t *usr_hdr;
-    uint32_t freed_size, node_t_size, header_t_size;
+    uint32_t freed_size;
 
     if (usr_ptr == NULL) {
         return;
@@ -180,9 +185,6 @@ void ff_free(void *usr_ptr) {
     // check integrity
     assert(usr_hdr->magic == MAGIC_NUMBER);
 
-    node_t_size = sizeof(struct node_t);
-    header_t_size = sizeof(struct header_t);
-    
     freed_size = usr_hdr->size;
     free_chunk = (struct node_t *) usr_hdr; 
 
@@ -192,7 +194,7 @@ void ff_free(void *usr_ptr) {
     // therefore in the split in ffmalloc we should allocate
     // enough memory to write header_t and then overwrite it with node_t
     //
-    free_chunk->size = freed_size + header_t_size - node_t_size;
+    free_chunk->size = freed_size;
     free_chunk->next = NULL;
 
     // easiest case:
@@ -247,14 +249,14 @@ void ff_free(void *usr_ptr) {
         
         // coalescing logic
         coalesce_ptr = (char *) free_chunk;
-        coalesce_size = free_chunk->size + node_t_size;
+        coalesce_size = free_chunk->size + hdr_size;
         
         // Do inserted chunk + prev. head form a continuous region in memory?
         // If so, then coalesce
         if ((coalesce_ptr + coalesce_size) == (char *) curr_ptr) {
             // TODO: something is off here
             // and probably in all if blocks below
-            free_chunk->size += curr_ptr->size + node_t_size;
+            free_chunk->size += curr_ptr->size + hdr_size;
             free_chunk->next = curr_ptr->next;        
         } 
 
@@ -270,10 +272,10 @@ void ff_free(void *usr_ptr) {
         // coalescing logic
    
         coalesce_ptr = (char *) prev_ptr;
-        coalesce_size = prev_ptr->size + node_t_size;
+        coalesce_size = prev_ptr->size + hdr_size;
 
         if ((coalesce_ptr + coalesce_size) == (char *) free_chunk) {
-            prev_ptr->size += free_chunk->size + node_t_size;
+            prev_ptr->size += free_chunk->size + hdr_size;
             prev_ptr->next = NULL;
         }
 
@@ -289,19 +291,19 @@ void ff_free(void *usr_ptr) {
         
         // prev + free chunk
         coalesce_ptr = (char *) prev_ptr;
-        coalesce_size = prev_ptr->size + node_t_size;
+        coalesce_size = prev_ptr->size + hdr_size;
 
         if ((coalesce_ptr + coalesce_size) == (char *) free_chunk) {
-            prev_ptr->size += free_chunk->size + node_t_size;
+            prev_ptr->size += free_chunk->size + hdr_size;
             free_chunk = prev_ptr;
         }
         
         // free chunk + current
         coalesce_ptr = (char *) free_chunk;
-        coalesce_size = free_chunk->size + node_t_size;
+        coalesce_size = free_chunk->size + hdr_size;
         
         if ((coalesce_ptr + coalesce_size) == (char *) curr_ptr) {
-            free_chunk->size += curr_ptr->size + node_t_size;
+            free_chunk->size += curr_ptr->size + hdr_size;
             free_chunk->next = curr_ptr->next;        
         } 
 
