@@ -1,16 +1,16 @@
 /**
- * Simple-malloc implementation
- * Simple memory allocator with splitting and coalising.
+ *
+ * Memory allocator with splitting and coalescing.
  * The requests are serviced according to the next fit policy.
  * Heavily insipired by OSTEP book.
  *
  * */
 
 #include <inttypes.h>
-#include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <assert.h>
 
 #define BLOCK_HEAP_SIZE 0x1000
 #define MAGIC_NUMBER 0x1234
@@ -27,20 +27,28 @@ struct node_t {
     struct node_t *next;
 };
 
+// head of the free list
 static struct node_t *global_ptr = NULL;
 
-void *smalloc(uint32_t size);
-void sfree(void *ptr);
+void *ffmalloc(uint32_t size);
+void ff_free(void *usr_ptr);
 
 int main(void) {
     char *ptr;
+    int i;
 
-    ptr = (char *) smalloc(10);
+    ptr = (char *) ffmalloc(10);
+    
+    for (i = 0; i < 10; i++) {
+        *(ptr + i) = i + 1;
+    }
+
+    ff_free(ptr);
 
     return 0;
 }
 
-void *smalloc(uint32_t size) {
+void *ffmalloc(uint32_t size) {
     struct node_t *curr_ptr, *prev_ptr;
     uint32_t node_t_size = sizeof(struct node_t);
     uint32_t header_t_size = sizeof(struct header_t);
@@ -52,12 +60,12 @@ void *smalloc(uint32_t size) {
         if ((curr_ptr->size + node_t_size) >= (size + header_t_size)) {
             break;
         }
-        curr_ptr = curr_ptr->next;
         prev_ptr = curr_ptr;
+        curr_ptr = curr_ptr->next;
     }
     
     // Failed to find one, so ask OS for more
-    // Although, there is no difference between 1st call to smalloc
+    // Although, there is no difference between 1st call to ffmalloc
     // and once all the free space has been consumed
     // Ask OS to grow heap
     if (curr_ptr == NULL) {
@@ -73,7 +81,7 @@ void *smalloc(uint32_t size) {
         }
         
         if (global_ptr == NULL) {
-            // 1st ever smalloc
+            // 1st ever ffmalloc
             // allocate 1st BLOCK_HEAP_SIZE with sbrk
             global_ptr = (struct node_t *) ptr;
             global_ptr->size = BLOCK_HEAP_SIZE - node_t_size;
@@ -87,9 +95,8 @@ void *smalloc(uint32_t size) {
             heap_chunk->size = BLOCK_HEAP_SIZE - node_t_size;
             heap_chunk->next = NULL;
             // update current and previous ptr-s
-            curr_ptr->next = heap_chunk;
-            prev_ptr = curr_ptr;
-            curr_ptr = curr_ptr->next;
+            prev_ptr->next = heap_chunk;
+            curr_ptr = heap_chunk;
         }
 
     }
@@ -101,11 +108,11 @@ void *smalloc(uint32_t size) {
         struct node_t *ptr_next;
         uint32_t ptr_size;
         char *tmp;
-        
-        // pointer to the memory user asked for
-        user_ptr = (void *) ((struct header_t *)curr_ptr + 1);
+
         // pointer to header user by free
         hdr = (struct header_t *) curr_ptr;
+        // pointer to the memory user asked for
+        user_ptr = (void *) (hdr + 1);
         
         // advance temp pointer to where next free chunk pointed by ptr
         // should be (sizeof header + sizeof user request)
@@ -121,10 +128,13 @@ void *smalloc(uint32_t size) {
         curr_ptr->next = ptr_next;
         curr_ptr->size = ptr_size - (header_t_size + size) + node_t_size;
 
-        // update previous node in the free list
+        // update previous node in the free list, if any
         if (prev_ptr != NULL) {
             prev_ptr->next = curr_ptr;  
-        } 
+        } else {
+            // curr_pointer was global_ptr
+            global_ptr = curr_ptr;
+        }
 
         // write header to user's chunk
         hdr->size = size;
@@ -156,7 +166,146 @@ void *smalloc(uint32_t size) {
     return user_ptr;
 }
 
-void sfree(void *ptr) {
+void ff_free(void *usr_ptr) {
+    struct node_t *free_chunk;
+    struct header_t *usr_hdr;
+    uint32_t freed_size, node_t_size, header_t_size;
+
+    if (usr_ptr == NULL) {
+        return;
+    }
+    
+    usr_hdr = ((struct header_t *) usr_ptr - 1);
+    
+    // check integrity
+    assert(usr_hdr->magic == MAGIC_NUMBER);
+
+    node_t_size = sizeof(struct node_t);
+    header_t_size = sizeof(struct header_t);
+    
+    freed_size = usr_hdr->size;
+    free_chunk = (struct node_t *) usr_hdr; 
+
+    // TODO: what if:
+    // header_t_size=8, node_t_size=16 and freed_size=2
+    // then 2 + 8 - 16 = -6 < 0
+    // therefore in the split in ffmalloc we should allocate
+    // enough memory to write header_t and then overwrite it with node_t
+    //
+    free_chunk->size = freed_size + header_t_size - node_t_size;
+    free_chunk->next = NULL;
+
+    // easiest case:
+    // we allocated everything,
+    // now we are getting back 1st chunk back
+    if (global_ptr == NULL) {
+        global_ptr = free_chunk;
+        return;
+    }
+
+    // otherwise,
+    // we do
+    // 1) insert somewhere in the list
+    // 2) coalesce the free list
+    
+    // We insert free chunk back into list by following next strategy:
+    // - we iterator on the list
+    // - once we meet the node whose next node 
+    //   has the address bigger that ours, we stop
+    // - and we insert after the current node
+    // It should produce the list with accessending addresses
+    // and it should be easy to coalesce:
+    // we check the nodes around for continuity of the address space
+    // we will have 3 cases to consider:
+    // - both nodes + currently inserted node is indeed one continuous space
+    // - the node before + inserted node form continuous space
+    // - the node after + inserted node form continuous space
+    // - none of the form with any other node the continuous space
+
+    struct node_t *prev_ptr, *curr_ptr;
+    prev_ptr = NULL;
+    curr_ptr = global_ptr;
+    while (curr_ptr != NULL) {
+        if (free_chunk < curr_ptr) {
+            break;
+        }
+        prev_ptr = curr_ptr;
+        curr_ptr = curr_ptr->next;
+    }
+    
+    // at this point 
+    // (prev_ptr == NULL) && (next_ptr == NULL) is always false
+    //
+    // Does the coalescing logic is different in all 3 cases?
+    //
+    if (prev_ptr == NULL) {
+        // insert into head
+        char *coalesce_ptr;
+        uint32_t coalesce_size;
+       
+        free_chunk->next = curr_ptr;
+        
+        // coalescing logic
+        coalesce_ptr = (char *) free_chunk;
+        coalesce_size = free_chunk->size + node_t_size;
+        
+        // Do inserted chunk + prev. head form a continuous region in memory?
+        // If so, then coalesce
+        if ((coalesce_ptr + coalesce_size) == (char *) curr_ptr) {
+            // TODO: something is off here
+            // and probably in all if blocks below
+            free_chunk->size += curr_ptr->size + node_t_size;
+            free_chunk->next = curr_ptr->next;        
+        } 
+
+        global_ptr = free_chunk;
+
+    } else if (curr_ptr == NULL) {
+        // insert into tail 
+        char *coalesce_ptr;
+        uint32_t coalesce_size;
+ 
+        prev_ptr->next = free_chunk;
+
+        // coalescing logic
+   
+        coalesce_ptr = (char *) prev_ptr;
+        coalesce_size = prev_ptr->size + node_t_size;
+
+        if ((coalesce_ptr + coalesce_size) == (char *) free_chunk) {
+            prev_ptr->size += free_chunk->size + node_t_size;
+            prev_ptr->next = NULL;
+        }
+
+    } else {
+        // insert between prev and next
+        char *coalesce_ptr;
+        uint32_t coalesce_size;
+
+        prev_ptr->next = free_chunk;
+        free_chunk->next = curr_ptr;
+
+        // coalescing logic
+        
+        // prev + free chunk
+        coalesce_ptr = (char *) prev_ptr;
+        coalesce_size = prev_ptr->size + node_t_size;
+
+        if ((coalesce_ptr + coalesce_size) == (char *) free_chunk) {
+            prev_ptr->size += free_chunk->size + node_t_size;
+            free_chunk = prev_ptr;
+        }
+        
+        // free chunk + current
+        coalesce_ptr = (char *) free_chunk;
+        coalesce_size = free_chunk->size + node_t_size;
+        
+        if ((coalesce_ptr + coalesce_size) == (char *) curr_ptr) {
+            free_chunk->size += curr_ptr->size + node_t_size;
+            free_chunk->next = curr_ptr->next;        
+        } 
+
+    }
 
 
 
